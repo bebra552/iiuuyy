@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup
 import random
 import ssl
 import logging
+from typing import Optional
 
 # --- Настройка логирования для более чистого вывода ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -26,6 +27,9 @@ COMPANY_CONCURRENCY = 10
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 3
 RETRY_DELAY = 2
+
+# DNS cache TTL for connector (seconds)
+DNS_CACHE_TTL = 300
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
@@ -55,6 +59,23 @@ def get_random_headers() -> dict:
 
 http_sem = asyncio.Semaphore(HTTP_CONCURRENCY)
 
+# Reuse SSL context and client timeout across requests
+SSL_CONTEXT = ssl.create_default_context()
+CLIENT_TIMEOUT = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+
+# Precompiled regex for company URL detection
+COMPANY_ID_RE = re.compile(r"-\d{6,}")
+
+# Base headers (including a single randomized User-Agent) to be set per session
+BASE_HEADERS: Optional[dict] = None
+
+# Try to use uvloop if available (faster and lower CPU overhead)
+try:
+    import uvloop  # type: ignore
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except Exception:
+    pass
+
 
 def ensure_trailing_slash(url: str) -> str:
     return url if url.endswith("/") else url + "/"
@@ -62,8 +83,9 @@ def ensure_trailing_slash(url: str) -> str:
 
 def is_company_url(path: str) -> bool:
     parts = [p for p in path.split("/") if p]
-    if len(parts) < 2: return False
-    return any(re.search(r"-\d{6,}", part) for part in parts)
+    if len(parts) < 2:
+        return False
+    return any(COMPANY_ID_RE.search(part) for part in parts)
 
 
 def extract_city_from_rubric(rubric_url: str) -> str | None:
@@ -78,15 +100,15 @@ def extract_city_from_rubric(rubric_url: str) -> str | None:
 async def fetch_text(session: ClientSession, url: str) -> str | None:
     for attempt in range(MAX_RETRIES):
         try:
-            headers = get_random_headers()
-            headers["Referer"] = f"{urlparse(url).scheme}://{urlparse(url).netloc}/"
+            parsed = urlparse(url)
+            # Use session-level headers and only add Referer per request
+            headers = (BASE_HEADERS or get_random_headers()).copy()
+            headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
 
             async with http_sem:
-                async with session.get(
-                        url, headers=headers, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-                        ssl=ssl.create_default_context()
-                ) as resp:
-                    text = await resp.text()
+                async with session.get(url, headers=headers) as resp:
+                    # Skip expensive charset detection; site is UTF-8
+                    text = await resp.text(encoding='utf-8', errors='ignore')
                     if "document.cookie='beget=begetok'" in text:
                         logging.info(f"Обнаружена защита Beget. Устанавливаю cookie для {url}")
                         session.cookie_jar.update_cookies({'beget': 'begetok'})
@@ -121,7 +143,7 @@ async def parse_sitemap_xml(session: ClientSession, url: str) -> list[str]:
 async def discover_city_rubrics_from_input(session: ClientSession, input_url: str) -> list[str]:
     url = input_url.strip()
     if url.endswith(".xml") and "/sitemap/" in url:
-        return sorted(await parse_sitemap_xml(session, url))
+        return await parse_sitemap_xml(session, url)
     logging.warning(f"Неопознанный тип ссылки: {url}")
     return []
 
@@ -162,33 +184,57 @@ async def parse_company(session: ClientSession, company_url: str, city: str | No
             if not contacts_panel:
                 contacts_panel = soup.select_one(".panel-body")
 
-        if contacts_panel:
-            for p_tag in contacts_panel.find_all("p"):
+        # Собираем параграфы либо из панели контактов, либо из всего документа (fallback)
+        candidate_paragraphs = contacts_panel.find_all("p") if contacts_panel else soup.find_all("p")
+        if candidate_paragraphs:
+            for p_tag in candidate_paragraphs:
                 text = p_tag.get_text(" ", strip=True)
-                p_html = str(p_tag)  # Получаем HTML код параграфа
+                # Быстрый поиск по классам иконок без преобразования в HTML-строку
+                icon_span = p_tag.find("span", class_=True)
+                icon_classes = icon_span.get("class", []) if icon_span else []
 
-                # Используем поиск по HTML коду (как во втором файле)
-                if "glyphicon-map-marker" in p_html:
-                    data["address"] = text
-                elif "glyphicon-earphone" in p_html:
-                    data["phones"] = text
-                elif "glyphicon-time" in p_html:
-                    data["schedule"] = text
-                elif "glyphicon-share" in p_html:
-                    data["website"] = text
-                elif "glyphicon-link" in p_html:
-                    # Собираем ссылки на соцсети
+                matched = False
+                if "glyphicon-map-marker" in icon_classes:
+                    data["address"] = text; matched = True
+                elif "glyphicon-earphone" in icon_classes:
+                    data["phones"] = text; matched = True
+                elif "glyphicon-time" in icon_classes:
+                    data["schedule"] = text; matched = True
+                elif "glyphicon-share" in icon_classes:
+                    data["website"] = text; matched = True
+                elif "glyphicon-link" in icon_classes:
                     links = [a.get("href") for a in p_tag.find_all("a", href=True)]
-                    data["socials"] = ", ".join(links) if links else text
-                elif "glyphicon-envelope" in p_html:
-                    data["email"] = text
-                elif "glyphicon-list" in p_html:
-                    # Собираем категории
+                    data["socials"] = ", ".join(links) if links else text; matched = True
+                elif "glyphicon-envelope" in icon_classes:
+                    data["email"] = text; matched = True
+                elif "glyphicon-list" in icon_classes:
                     cats = [a.get_text(strip=True) for a in p_tag.find_all("a")]
-                    data["categories"] = ", ".join(cats) if cats else text
+                    data["categories"] = ", ".join(cats) if cats else text; matched = True
 
-        logging.info(
-            f"    ↳ Собраны данные для компании: {data['name']} | Адрес: {bool(data['address'])} | Телефон: {bool(data['phones'])}")
+                # Редкий случай: запасной путь через поиск по HTML (миграционная совместимость)
+                if not matched:
+                    p_html = str(p_tag)
+                    if "glyphicon-map-marker" in p_html:
+                        data["address"] = text
+                    elif "glyphicon-earphone" in p_html:
+                        data["phones"] = text
+                    elif "glyphicon-time" in p_html:
+                        data["schedule"] = text
+                    elif "glyphicon-share" in p_html:
+                        data["website"] = text
+                    elif "glyphicon-link" in p_html:
+                        links = [a.get("href") for a in p_tag.find_all("a", href=True)]
+                        data["socials"] = ", ".join(links) if links else text
+                    elif "glyphicon-envelope" in p_html:
+                        data["email"] = text
+                    elif "glyphicon-list" in p_html:
+                        cats = [a.get_text(strip=True) for a in p_tag.find_all("a")]
+                        data["categories"] = ", ".join(cats) if cats else text
+
+        logging.debug(
+            "    ↳ Собраны данные для компании: %s | Адрес: %s | Телефон: %s",
+            data['name'], bool(data['address']), bool(data['phones'])
+        )
         return data
     except Exception as e:
         logging.error(f"Ошибка при парсинге карточки компании {company_url}: {e}")
@@ -218,7 +264,14 @@ async def parse_category(session: ClientSession, rubric_url: str, csv_writer, lo
                 logging.info(f"Достигнут конец рубрики {city}/{rubric_name} на странице {page}.")
             break
 
-        company_urls = sorted(list(set(BASE + href if href.startswith('/') else href for href in company_links)))
+        # Собираем абсолютные ссылки и удаляем дубликаты, сохраняя порядок
+        seen_urls = set()
+        company_urls = []
+        for href in company_links:
+            abs_url = BASE + href if href.startswith('/') else href
+            if abs_url not in seen_urls:
+                seen_urls.add(abs_url)
+                company_urls.append(abs_url)
         logging.info(
             f"  Страница {page} [{city}/{rubric_name}]: найдено {len(company_urls)} компаний. Начинаю сбор данных...")
 
@@ -240,7 +293,8 @@ async def parse_category(session: ClientSession, rubric_url: str, csv_writer, lo
                 f"  Страница {page} [{city}/{rubric_name}]: СОХРАНЕНО {len(valid_results)}/{len(company_urls)} компаний в CSV.")
             total_companies_in_rubric += len(valid_results)
 
-        await asyncio.sleep(random.uniform(0.1, 0.3))
+        # Небольшая пауза между страницами для снижения нагрузки, но быстрее, чем раньше
+        await asyncio.sleep(random.uniform(0.02, 0.05))
         page += 1
 
     logging.info(f"✅ Рубрика {city}/{rubric_name} завершена. Всего собрано: {total_companies_in_rubric} компаний.")
@@ -257,13 +311,33 @@ async def main():
     with open(INPUT_FILE, "r", encoding="utf-8") as f:
         input_lines = [line.strip() for line in f if line.strip()]
 
-    connector = TCPConnector(limit=HTTP_CONCURRENCY, limit_per_host=HTTP_CONCURRENCY, enable_cleanup_closed=True)
+    connector = TCPConnector(
+        limit=HTTP_CONCURRENCY,
+        limit_per_host=HTTP_CONCURRENCY,
+        ttl_dns_cache=DNS_CACHE_TTL,
+        ssl=SSL_CONTEXT,
+        enable_cleanup_closed=True,
+    )
 
-    async with ClientSession(connector=connector) as session:
+    # Инициализируем единые заголовки для всей сессии (случайный User-Agent один раз)
+    global BASE_HEADERS
+    BASE_HEADERS = get_random_headers()
+
+    async with ClientSession(connector=connector, timeout=CLIENT_TIMEOUT, headers=BASE_HEADERS) as session:
         logging.info("--- ЭТАП 1: Сбор URL рубрик из sitemap-ов ---")
         discovery_tasks = [discover_city_rubrics_from_input(session, line) for line in input_lines]
-        rubric_urls = sorted(list(set(url for url_list in await asyncio.gather(*discovery_tasks) for url in url_list if
-                                      not is_company_url(urlparse(url).path))))
+        results = await asyncio.gather(*discovery_tasks)
+
+        # Дедупликация рубрик без сортировки (сохраняем порядок обнаружения)
+        rubric_urls = []
+        seen_rubrics = set()
+        for url_list in results:
+            for url in url_list:
+                if is_company_url(urlparse(url).path):
+                    continue
+                if url not in seen_rubrics:
+                    seen_rubrics.add(url)
+                    rubric_urls.append(url)
 
         if not rubric_urls:
             logging.critical("❌ Не найдено ни одной рубрики для парсинга.")
@@ -277,19 +351,21 @@ async def main():
 
         logging.info(f"\n--- ЭТАП 2: Парсинг компаний из рубрик ---")
         try:
-            with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as f:
+            # Увеличиваем буферизацию записи в файл для уменьшения нагрузки на диск
+            with open(OUTPUT_FILE, "w", newline="", encoding="utf-8", buffering=1024*1024) as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
                 logging.info(f"Создан CSV файл: {OUTPUT_FILE}")
 
                 sem_category = asyncio.Semaphore(CATEGORY_CONCURRENCY)
                 progress_counter = 0
+                progress_lock = asyncio.Lock()
 
                 async def run_category(rurl):
                     nonlocal progress_counter
                     async with sem_category:
                         await parse_category(session, rurl, writer, csv_lock)
-                    async with csv_lock:
+                    async with progress_lock:
                         progress_counter += 1
                         progress = (progress_counter / len(rubric_urls)) * 100
                         logging.info(
