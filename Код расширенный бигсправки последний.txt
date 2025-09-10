@@ -1,7 +1,7 @@
 import asyncio
 import aiohttp
 from aiohttp import ClientSession, TCPConnector
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs, unquote
 import csv
 import os
 import re
@@ -65,6 +65,7 @@ CLIENT_TIMEOUT = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
 
 # Precompiled regex for company URL detection
 COMPANY_ID_RE = re.compile(r"-\d{6,}")
+URL_IN_TEXT_RE = re.compile(r"https?://[^\s\"\)\]]+", re.IGNORECASE)
 
 # Base headers (including a single randomized User-Agent) to be set per session
 BASE_HEADERS: Optional[dict] = None
@@ -95,6 +96,55 @@ def extract_city_from_rubric(rubric_url: str) -> str | None:
         return parts[0] if parts else None
     except Exception:
         return None
+
+
+def normalize_domain(domain: str | None) -> str | None:
+    if not domain:
+        return None
+    domain = domain.strip().lower()
+    if domain.startswith("www."):
+        domain = domain[4:]
+    return domain or None
+
+
+def extract_domain_from_text(text: str | None) -> str | None:
+    if not text:
+        return None
+    # Handle "green_url" style: domain›title
+    if "›" in text:
+        candidate = text.split("›", 1)[0].strip()
+        return normalize_domain(candidate)
+    # Find first http(s) URL
+    match = URL_IN_TEXT_RE.search(text)
+    if match:
+        return normalize_domain(urlparse(match.group(0)).netloc)
+    # Fallback: bare domain separated by spaces
+    parts = text.split()
+    for part in parts:
+        if "." in part and not part.startswith("http"):
+            # Try parse as domain
+            maybe = part.strip("()[]{};,'\"")
+            if "." in maybe:
+                return normalize_domain(maybe)
+    return None
+
+
+def pick_target_domain_from_href(href: str | None) -> str | None:
+    if not href:
+        return None
+    parsed = urlparse(href)
+    host = parsed.netloc.lower()
+    # Try to resolve known redirect patterns
+    if host.endswith("yabs.yandex.ru") or host.endswith("yandex.ru"):
+        qs = parse_qs(parsed.query)
+        for key in ("url", "u", "target", "to"):
+            if key in qs and qs[key]:
+                try:
+                    target = unquote(qs[key][0])
+                    return normalize_domain(urlparse(target).netloc or target)
+                except Exception:
+                    continue
+    return normalize_domain(host)
 
 
 async def fetch_text(session: ClientSession, url: str) -> str | None:
@@ -164,6 +214,7 @@ async def parse_company(session: ClientSession, company_url: str, city: str | No
             "phones": None,
             "schedule": None,
             "website": None,
+            "domain": None,
             "socials": None,
             "email": None,
             "categories": None
@@ -201,7 +252,10 @@ async def parse_company(session: ClientSession, company_url: str, city: str | No
                 elif "glyphicon-time" in icon_classes:
                     data["schedule"] = text; matched = True
                 elif "glyphicon-share" in icon_classes:
-                    data["website"] = text; matched = True
+                    link = p_tag.find("a", href=True)
+                    href = link.get("href") if link else None
+                    data["website"] = href or text; matched = True
+                    data["domain"] = pick_target_domain_from_href(href) or extract_domain_from_text(text)
                 elif "glyphicon-link" in icon_classes:
                     links = [a.get("href") for a in p_tag.find_all("a", href=True)]
                     data["socials"] = ", ".join(links) if links else text; matched = True
@@ -222,6 +276,8 @@ async def parse_company(session: ClientSession, company_url: str, city: str | No
                         data["schedule"] = text
                     elif "glyphicon-share" in p_html:
                         data["website"] = text
+                        if not data.get("domain"):
+                            data["domain"] = extract_domain_from_text(text)
                     elif "glyphicon-link" in p_html:
                         links = [a.get("href") for a in p_tag.find_all("a", href=True)]
                         data["socials"] = ", ".join(links) if links else text
@@ -300,6 +356,22 @@ async def parse_category(session: ClientSession, rubric_url: str, csv_writer, lo
     logging.info(f"✅ Рубрика {city}/{rubric_name} завершена. Всего собрано: {total_companies_in_rubric} компаний.")
 
 
+async def process_single_input(session: ClientSession, line: str) -> list[str]:
+    line = line.strip()
+    if not line:
+        return []
+    # If it's a BigSpr sitemap
+    if line.endswith(".xml") and "/sitemap/" in line:
+        return await parse_sitemap_xml(session, line)
+    # If it's a BigSpr rubric or company URL
+    parsed = urlparse(line)
+    if parsed.netloc.endswith("bigspr.ru"):
+        return [line]
+    # Otherwise: treat as arbitrary search/result URL; we do not follow it here
+    logging.warning(f"Пропускаю неродной URL: {line}")
+    return []
+
+
 async def main():
     start_time = asyncio.get_event_loop().time()
     logging.info("🚀 Запуск парсера BigSpr...")
@@ -324,34 +396,42 @@ async def main():
     BASE_HEADERS = get_random_headers()
 
     async with ClientSession(connector=connector, timeout=CLIENT_TIMEOUT, headers=BASE_HEADERS) as session:
-        logging.info("--- ЭТАП 1: Сбор URL рубрик из sitemap-ов ---")
-        discovery_tasks = [discover_city_rubrics_from_input(session, line) for line in input_lines]
-        results = await asyncio.gather(*discovery_tasks)
+        logging.info("--- ЭТАП 1: Сбор входных ссылок (sitemap/рубрики/компании) ---")
+        # Поддержка прямых ссылок: sitemap, рубрика, карточка компании
+        tasks = [process_single_input(session, line) for line in input_lines]
+        raw_urls_nested = await asyncio.gather(*tasks)
 
-        # Дедупликация рубрик без сортировки (сохраняем порядок обнаружения)
-        rubric_urls = []
-        seen_rubrics = set()
-        for url_list in results:
-            for url in url_list:
-                if is_company_url(urlparse(url).path):
-                    continue
-                if url not in seen_rubrics:
-                    seen_rubrics.add(url)
-                    rubric_urls.append(url)
+        # Плоский список и дедупликация с сохранением порядка
+        seen = set()
+        all_urls: list[str] = []
+        for lst in raw_urls_nested:
+            for u in lst:
+                if u not in seen:
+                    seen.add(u)
+                    all_urls.append(u)
 
-        if not rubric_urls:
-            logging.critical("❌ Не найдено ни одной рубрики для парсинга.")
+        # Делим на рубрики и карточки
+        rubric_urls: list[str] = []
+        company_urls_direct: list[str] = []
+        for u in all_urls:
+            if is_company_url(urlparse(u).path):
+                company_urls_direct.append(u)
+            else:
+                rubric_urls.append(u)
+
+        total_inputs = len(rubric_urls) + len(company_urls_direct)
+        if total_inputs == 0:
+            logging.critical("❌ Не найдено валидных входных ссылок для парсинга.")
             return
 
-        logging.info(f"✅ ИТОГ ЭТАПА 1: Найдено {len(rubric_urls)} уникальных рубрик для парсинга.")
+        logging.info(f"✅ ИТОГ ЭТАПА 1: Рубрик: {len(rubric_urls)} | Компаний напрямую: {len(company_urls_direct)}")
 
-        fieldnames = ["city", "rubric_url", "url", "name", "address", "phones", "schedule", "website", "socials",
+        fieldnames = ["city", "rubric_url", "url", "name", "address", "phones", "schedule", "website", "domain", "socials",
                       "email", "categories"]
         csv_lock = asyncio.Lock()
 
-        logging.info(f"\n--- ЭТАП 2: Парсинг компаний из рубрик ---")
+        logging.info(f"\n--- ЭТАП 2: Парсинг компаний ---")
         try:
-            # Увеличиваем буферизацию записи в файл для уменьшения нагрузки на диск
             with open(OUTPUT_FILE, "w", newline="", encoding="utf-8", buffering=1024*1024) as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
@@ -367,11 +447,34 @@ async def main():
                         await parse_category(session, rurl, writer, csv_lock)
                     async with progress_lock:
                         progress_counter += 1
-                        progress = (progress_counter / len(rubric_urls)) * 100
+                        total = len(rubric_urls) + len(company_urls_direct)
+                        progress = (progress_counter / total) * 100
                         logging.info(
-                            f"📈 ПРОГРЕСС: {progress_counter}/{len(rubric_urls)} ({progress:.1f}%) | Время: {asyncio.get_event_loop().time() - start_time:.0f}с")
+                            f"📈 ПРОГРЕСС: {progress_counter}/{total} ({progress:.1f}%) | Время: {asyncio.get_event_loop().time() - start_time:.0f}с")
 
+                # 1) Сначала обработаем рубрики (страничный сбор)
                 await asyncio.gather(*[run_category(r) for r in rubric_urls])
+
+                # 2) Затем обработаем прямые ссылки на компании
+                if company_urls_direct:
+                    logging.info(f"Обрабатываю прямые карточки компаний: {len(company_urls_direct)}")
+                    sem_company = asyncio.Semaphore(COMPANY_CONCURRENCY)
+
+                    async def run_company(curl: str):
+                        nonlocal progress_counter
+                        async with sem_company:
+                            data = await parse_company(session, curl, extract_city_from_rubric(curl), curl)
+                            if data:
+                                async with csv_lock:
+                                    writer.writerow(data)
+                        async with progress_lock:
+                            progress_counter += 1
+                            total = len(rubric_urls) + len(company_urls_direct)
+                            progress = (progress_counter / total) * 100
+                            logging.info(
+                                f"📈 ПРОГРЕСС: {progress_counter}/{total} ({progress:.1f}%) | Время: {asyncio.get_event_loop().time() - start_time:.0f}с")
+
+                    await asyncio.gather(*[run_company(u) for u in company_urls_direct])
         except IOError as e:
             logging.critical(f"Ошибка записи в файл {OUTPUT_FILE}: {e}")
 
