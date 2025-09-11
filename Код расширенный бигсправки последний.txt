@@ -1,649 +1,395 @@
-import pandas as pd
-from playwright.sync_api import sync_playwright
-from bs4 import BeautifulSoup
-import time
-from urllib.parse import quote_plus, urlparse
-import json
-from datetime import datetime
-import sys
-import traceback
+import asyncio
+import aiohttp
+from aiohttp import ClientSession, TCPConnector
+from urllib.parse import urlparse
+import csv
+import os
 import re
-import requests
-from typing import Dict, Optional, List
+import xml.etree.ElementTree as ET
+from bs4 import BeautifulSoup
+import random
+import ssl
+import logging
+from typing import Optional
 
-# =================== НАСТРОЙКИ ===================
-SEARCH_QUERY = "Сэндвич панели"
-PAGES_TO_SCRAPE = 1  # сколько страниц собирать (минимум 1)
-CSV_FILE_NAME = "yandex_search_results.csv"
-CSV_WITH_WHOIS_NAME = "yandex_search_results_with_whois.csv"
-SLOW_MO_MS = 80  # замедление действий браузера
-WAIT_SELECTOR_TIMEOUT = 15000  # мс ожидания появления результатов
-PAUSE_AFTER_NAV_SEC = 2.0  # пауза после перехода на страницу
-AUTOSAVE_AFTER_EACH_PAGE = False  # True чтобы сохранять CSV после каждой страницы
-WHOIS_REQUEST_DELAY = 1.0  # задержка между запросами к whois.ru (секунды)
-# =================================================
+# --- Настройка логирования для более чистого вывода ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Селекторы
-RESULT_ITEM_SELECTOR = 'li.serp-item'
-ALT_RESULT_SELECTORS = [
-    'div.serp-item',
-    'div.organic',
-    'article.serp-item',
-    'li.organic'
+# --- Основные константы ---
+BASE = "https://bigspr.ru"
+INPUT_FILE = r"C:\\Users\\User\\Desktop\\ssilki.txt"
+OUTPUT_FILE = "companies_full_fast.csv"
+
+# --- Настройки для максимальной скорости ---
+HTTP_CONCURRENCY = 50
+CATEGORY_CONCURRENCY = 8
+COMPANY_CONCURRENCY = 10
+REQUEST_TIMEOUT = 30
+MAX_RETRIES = 3
+RETRY_DELAY = 2
+
+# DNS cache TTL for connector (seconds)
+DNS_CACHE_TTL = 300
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 ]
-NEXT_BTN_SELECTORS = [
-    'a.Pager-Item_type_next',
-    'a.Link[aria-label="Следующая страница"]',
-    'a[aria-label="Следующая страница"]',
-    'a.pager__item_kind_next',
-    'a.pager__item_kind_next_link'
-]
-PHONE_BUTTON_SELECTOR = 'button.CoveredPhone-Button'
-PHONE_SPAN_SELECTOR = 'span.CoveredPhone'
-PHONE_FULL_SELECTOR = 'span.CoveredPhone-Full'
 
 
-def extract_domain_from_url(url: str) -> Optional[str]:
-    """Извлекает чистый домен из URL или green_url"""
-    if not url:
-        return None
-
-    try:
-        # Если это yandex redirect URL, пропускаем
-        if 'yabs.yandex.ru' in url or 'yandex.ru' in url:
-            return None
-
-        # Убираем все после › символа (для green_url)
-        if '›' in url:
-            url = url.split('›')[0]
-
-        # Добавляем протокол если его нет
-        if not url.startswith(('http://', 'https://')):
-            url = 'https://' + url
-
-        parsed = urlparse(url)
-        domain = parsed.netloc
-
-        # Убираем www. и другие субдомены, кроме основного
-        if domain.startswith('www.'):
-            domain = domain[4:]
-
-        # Проверяем что это валидный домен
-        if '.' not in domain or len(domain) < 4:
-            return None
-
-        return domain.lower()
-    except Exception:
-        return None
-
-
-def get_whois_data(domain: str) -> Dict[str, Optional[str]]:
-    """Получает данные WHOIS для домена через whois.ru с использованием браузера"""
-
-    whois_data = {
-        'domain': domain,
-        'citation_index': None,
-        'alexa_rating': None,
-        'registrar': None,
-        'registration_date': None,
-        'expiration_date': None,
-        'days_until_expiration': None,
-        'check_date': None,
-        'external_links': None,
-        'internal_links': None,
-        'total_anchors': None,
-        'outgoing_anchors': None,
-        'domain_links': None,
-        'page_title': None,
-        'page_description': None,
-        'whois_error': None
+def get_random_headers() -> dict:
+    ua = random.choice(USER_AGENTS)
+    return {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+        "DNT": "1",
     }
 
+
+http_sem = asyncio.Semaphore(HTTP_CONCURRENCY)
+
+# Reuse SSL context and client timeout across requests
+SSL_CONTEXT = ssl.create_default_context()
+CLIENT_TIMEOUT = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+
+# Precompiled regex for company URL detection
+COMPANY_ID_RE = re.compile(r"-\d{6,}")
+
+# Base headers (including a single randomized User-Agent) to be set per session
+BASE_HEADERS: Optional[dict] = None
+
+# Try to use uvloop if available (faster and lower CPU overhead)
+try:
+    import uvloop  # type: ignore
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except Exception:
+    pass
+
+
+def ensure_trailing_slash(url: str) -> str:
+    return url if url.endswith("/") else url + "/"
+
+
+def is_company_url(path: str) -> bool:
+    parts = [p for p in path.split("/") if p]
+    if len(parts) < 2:
+        return False
+    return any(COMPANY_ID_RE.search(part) for part in parts)
+
+
+def extract_city_from_rubric(rubric_url: str) -> str | None:
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-
-            # Заходим на страницу домена
-            whois_url = f'https://whois.ru/{domain}'
-            page.goto(whois_url, wait_until='domcontentloaded')
-
-            # Ждем загрузки данных (проверяем появление блоков с информацией)
-            try:
-                page.wait_for_selector('.list-group-item', timeout=10000)
-            except:
-                # Если данные не загрузились, возможно нужно нажать кнопку
-                try:
-                    button = page.query_selector('#whois_btn')
-                    if button:
-                        button.click()
-                        page.wait_for_selector('.list-group-item', timeout=10000)
-                except:
-                    pass
-
-            # Получаем HTML и парсим
-            html_content = page.content()
-            browser.close()
-
-        soup = BeautifulSoup(html_content, 'html.parser')
-
-        # Ищем блоки с данными
-        list_groups = soup.find_all('ul', class_='list-group')
-
-        for ul in list_groups:
-            items = ul.find_all('li', class_='list-group-item')
-
-            for item in items:
-                text = item.get_text().strip()
-                strong = item.find('strong')
-
-                if not strong:
-                    continue
-
-                value = strong.get_text().strip()
-
-                if 'Индекс цитирования' in text:
-                    whois_data['citation_index'] = value
-                elif 'Рейтинг Alexa' in text:
-                    whois_data['alexa_rating'] = value
-                elif 'Регистратор домена' in text:
-                    whois_data['registrar'] = value
-                elif 'Дата регистрации' in text:
-                    whois_data['registration_date'] = value
-                elif 'Дата окончания' in text:
-                    whois_data['expiration_date'] = value
-                elif 'Закончится через' in text:
-                    whois_data['days_until_expiration'] = value
-                elif 'Дата проверки' in text:
-                    whois_data['check_date'] = value
-                elif 'Внешние ссылки домена' in text:
-                    whois_data['external_links'] = value
-                elif 'Внутренние ссылки' in text:
-                    whois_data['internal_links'] = value
-                elif 'Кол-во найденных анкоров' in text:
-                    whois_data['total_anchors'] = value
-                elif 'Кол-во исходящих анкоров' in text:
-                    whois_data['outgoing_anchors'] = value
-                elif 'Кол-во ссылок на домене' in text:
-                    whois_data['domain_links'] = value
-                elif 'Title страницы' in text:
-                    whois_data['page_title'] = value
-                elif 'Description страницы' in text:
-                    whois_data['page_description'] = value
-
-        time.sleep(WHOIS_REQUEST_DELAY)
-
-    except Exception as e:
-        whois_data['whois_error'] = f'Error: {str(e)}'
-
-    return whois_data
-
-
-def process_whois_for_domains(all_data: List[Dict]) -> List[Dict]:
-    """Обрабатывает WHOIS данные для уникальных доменов"""
-
-    # Извлекаем уникальные домены
-    unique_domains = set()
-
-    for item in all_data:
-        # Пробуем извлечь домен из green_url
-        domain = extract_domain_from_url(item.get('green_url'))
-        if domain:
-            unique_domains.add(domain)
-        else:
-            # Если не получилось, пробуем из url
-            domain = extract_domain_from_url(item.get('url'))
-            if domain:
-                unique_domains.add(domain)
-
-    unique_domains = list(unique_domains)
-    print(f"\n[WHOIS] Найдено уникальных доменов для проверки: {len(unique_domains)}")
-
-    if not unique_domains:
-        print("[WHOIS] Нет доменов для проверки")
-        return all_data
-
-    # Получаем WHOIS данные для каждого домена
-    whois_results = {}
-
-    for i, domain in enumerate(unique_domains, 1):
-        print(f"[WHOIS] Обрабатываю домен {i}/{len(unique_domains)}: {domain}")
-        whois_data = get_whois_data(domain)
-        whois_results[domain] = whois_data
-
-        if whois_data['whois_error']:
-            print(f"[WHOIS] Ошибка для {domain}: {whois_data['whois_error']}")
-        else:
-            print(f"[WHOIS] Успешно получены данные для {domain}")
-
-    # Добавляем WHOIS данные к основным результатам
-    enhanced_data = []
-
-    for item in all_data:
-        enhanced_item = item.copy()
-
-        # Определяем домен для данного элемента
-        domain = extract_domain_from_url(item.get('green_url'))
-        if not domain:
-            domain = extract_domain_from_url(item.get('url'))
-
-        if domain and domain in whois_results:
-            whois_info = whois_results[domain]
-            # Добавляем все WHOIS поля к элементу
-            enhanced_item.update({
-                'whois_domain': whois_info['domain'],
-                'whois_citation_index': whois_info['citation_index'],
-                'whois_alexa_rating': whois_info['alexa_rating'],
-                'whois_registrar': whois_info['registrar'],
-                'whois_registration_date': whois_info['registration_date'],
-                'whois_expiration_date': whois_info['expiration_date'],
-                'whois_days_until_expiration': whois_info['days_until_expiration'],
-                'whois_check_date': whois_info['check_date'],
-                'whois_external_links': whois_info['external_links'],
-                'whois_internal_links': whois_info['internal_links'],
-                'whois_total_anchors': whois_info['total_anchors'],
-                'whois_outgoing_anchors': whois_info['outgoing_anchors'],
-                'whois_domain_links': whois_info['domain_links'],
-                'whois_page_title': whois_info['page_title'],
-                'whois_page_description': whois_info['page_description'],
-                'whois_error': whois_info['whois_error']
-            })
-        else:
-            # Добавляем пустые WHOIS поля
-            enhanced_item.update({
-                'whois_domain': None,
-                'whois_citation_index': None,
-                'whois_alexa_rating': None,
-                'whois_registrar': None,
-                'whois_registration_date': None,
-                'whois_expiration_date': None,
-                'whois_days_until_expiration': None,
-                'whois_check_date': None,
-                'whois_external_links': None,
-                'whois_internal_links': None,
-                'whois_total_anchors': None,
-                'whois_outgoing_anchors': None,
-                'whois_domain_links': None,
-                'whois_page_title': None,
-                'whois_page_description': None,
-                'whois_error': 'No domain found'
-            })
-
-        enhanced_data.append(enhanced_item)
-
-    return enhanced_data
-
-
-def banner_wait_for_user(reason: str):
-    print("\n" + "=" * 60)
-    print("ACTION REQUIRED:", reason)
-    input("Когда результаты видны и капча пройдена, нажми Enter...")
-    print("=" * 60 + "\n")
-
-
-def ensure_results_visible(page):
-    while True:
-        try:
-            page.wait_for_load_state('domcontentloaded', timeout=10000)
-        except Exception:
-            pass
-        try:
-            if page.query_selector(RESULT_ITEM_SELECTOR):
-                return True
-            page.wait_for_selector(RESULT_ITEM_SELECTOR, timeout=WAIT_SELECTOR_TIMEOUT)
-            return True
-        except Exception:
-            banner_wait_for_user("Похоже, капча или результаты не видны. Нужна ручная проверка.")
-
-
-def reveal_phones(page):
-    try:
-        buttons = page.query_selector_all(PHONE_BUTTON_SELECTOR)
+        path = urlparse(rubric_url).path
+        parts = [p for p in path.split("/") if p]
+        return parts[0] if parts else None
     except Exception:
-        buttons = []
-    if not buttons:
-        return
-    print(f"[phones] Найдено кнопок для раскрытия телефонов: {len(buttons)}")
-    for btn in buttons:
+        return None
+
+
+async def fetch_text(session: ClientSession, url: str) -> str | None:
+    for attempt in range(MAX_RETRIES):
         try:
-            btn.scroll_into_view_if_needed()
-            try:
-                btn.click(timeout=3000)
-            except Exception:
-                page.evaluate("(el) => el.click()", btn)
-            time.sleep(0.4)
+            parsed = urlparse(url)
+            # Use session-level headers and only add Referer per request
+            headers = (BASE_HEADERS or get_random_headers()).copy()
+            headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
+
+            async with http_sem:
+                async with session.get(url, headers=headers) as resp:
+                    # Skip expensive charset detection; site is UTF-8
+                    text = await resp.text(encoding='utf-8', errors='ignore')
+                    if "document.cookie='beget=begetok'" in text:
+                        logging.info(f"Обнаружена защита Beget. Устанавливаю cookie для {url}")
+                        session.cookie_jar.update_cookies({'beget': 'begetok'})
+                        await asyncio.sleep(0.5)
+                        continue
+                    if resp.status == 200:
+                        return text
+                    logging.warning(f"Статус {resp.status} при запросе к {url} (попытка {attempt + 1})")
         except Exception as e:
-            print(f"[phones] Ошибка при клике: {e}")
-
-
-def extract_rating_and_reviews(result):
-    """Извлекает рейтинг и отзывы из различных форматов"""
-    rating = None
-    reviews_count = None
-
-    # Поиск контейнера с рейтингом - новый подход
-    rating_containers = [
-        result.select_one('div.OrganicUgcReviews'),
-        result.select_one('div.ShopInfo-Ugc'),
-        result.select_one('div.VanillaReact.OrganicUgcReviews'),
-        result.select_one('div[data-vnl*="rate"]')
-    ]
-
-    for container in rating_containers:
-        if not container:
-            continue
-
-        # Попытка извлечь из data-vnl атрибута
-        data_vnl = container.get('data-vnl')
-        if data_vnl:
-            try:
-                # Очистка HTML entities
-                cleaned_json = data_vnl.replace('&quot;', '"').replace('&amp;', '&').replace('&nbsp;', ' ')
-                data = json.loads(cleaned_json)
-
-                # Поиск рейтинга в JSON
-                if 'ecomRates' in data:
-                    ecom_data = data['ecomRates']
-                    if 'rate' in ecom_data:
-                        rating = str(ecom_data['rate']).replace(',', '.')
-                    if 'reviewCount' in ecom_data:
-                        reviews_count = str(ecom_data['reviewCount'])
-                    elif 'reviewCountText' in ecom_data:
-                        reviews_text = ecom_data['reviewCountText']
-                        # Извлекаем число из текста типа "13 473 отзыва"
-                        numbers = re.findall(r'[\d\s]+', reviews_text.replace('\u00a0', ' '))
-                        if numbers:
-                            reviews_count = ''.join(numbers).replace(' ', '').strip()
-
-                if rating and reviews_count:
-                    return rating, reviews_count
-
-            except Exception as e:
-                print(f"[rating] Ошибка парсинга JSON из data-vnl: {e}")
-
-        # Если JSON не сработал, пробуем извлечь из HTML
-        # Поиск рейтинга
-        rating_elements = [
-            container.select_one('.RatingOneStar .Line-AddonContent'),
-            container.select_one('.RatingOneStar div[aria-hidden="true"]'),
-            container.select_one('.OrganicUgcReviews-Rating .Line-AddonContent'),
-            container.select_one('span.A11yHidden')
-        ]
-
-        for elem in rating_elements:
-            if elem and not rating:
-                text = elem.get_text(strip=True)
-                if 'рейтинг' in text.lower():
-                    # Извлекаем число из текста типа "Рейтинг: 4,7 из 5"
-                    match = re.search(r'[\d,\.]+', text)
-                    if match:
-                        rating = match.group().replace(',', '.')
-                elif re.match(r'^[\d,\.]+$', text):
-                    rating = text.replace(',', '.')
-
-        # Поиск отзывов
-        reviews_elements = [
-            container.select_one('.EReviews'),
-            container.select_one('.OrganicUgcReviews-Text'),
-            container.select_one('div[class*="Reviews"]')
-        ]
-
-        for elem in reviews_elements:
-            if elem and not reviews_count:
-                text = elem.get_text(strip=True)
-                # Извлекаем числа из текста типа "13,5K отзывов", "1234 отзыва"
-                if 'отзыв' in text.lower():
-                    # Обработка форматов типа "13,5K", "1.2K", "123"
-                    numbers = re.findall(r'[\d,\.]+[KkКк]?', text)
-                    if numbers:
-                        num_text = numbers[0]
-                        if 'k' in num_text.lower() or 'к' in num_text.lower():
-                            # Конвертируем K в число
-                            base_num = float(
-                                num_text.replace('K', '').replace('k', '').replace('К', '').replace('к', '').replace(
-                                    ',', '.'))
-                            reviews_count = str(int(base_num * 1000))
-                        else:
-                            reviews_count = num_text.replace(',', '').replace('.', '')
-
-        if rating and reviews_count:
-            break
-
-    return rating, reviews_count
-
-
-def parse_page(html_content: str, page_number: int, parsed_date: str):
-    soup = BeautifulSoup(html_content, 'html.parser')
-    results = soup.select(RESULT_ITEM_SELECTOR)
-    if not results:
-        for alt in ALT_RESULT_SELECTORS:
-            results = soup.select(alt)
-            if results:
-                break
-    page_data = []
-    for idx, result in enumerate(results, start=1):
-        data = {
-            'title': None,
-            'url': None,
-            'green_url': None,
-            'description': None,
-            'phone': None,
-            'work_time': None,
-            'rating': None,
-            'reviews_count': None,
-            'page_number': page_number,
-            'parsed_date': parsed_date
-        }
-        try:
-            # Title + URL
-            title_element = (
-                    result.select_one('h2.OrganicTitle-LinkText') or
-                    result.select_one('h2.organic__title-wrapper span.organic__title') or
-                    result.select_one('h2 a') or
-                    result.select_one('a.OrganicTitle-Link') or
-                    result.select_one('a.organic__url')
-            )
-            if title_element:
-                if title_element.name == 'a':
-                    data['title'] = title_element.get_text(strip=True)
-                    data['url'] = title_element.get('href')
-                else:
-                    data['title'] = title_element.get_text(strip=True)
-                    link = result.select_one('h2 a') or result.select_one('a.OrganicTitle-Link') or result.select_one(
-                        'a.organic__url')
-                    if link:
-                        data['url'] = link.get('href')
-
-            # Green URL
-            green_url_element = (
-                    result.select_one('a.organic__greenurl') or
-                    result.select_one('div.Path') or
-                    result.select_one('div.Organic-Path') or
-                    result.select_one('span.organic__url-text')
-            )
-            if green_url_element:
-                data['green_url'] = green_url_element.get_text(strip=True)
-
-            # Description
-            description_element = (
-                    result.select_one('div.OrganicText') or
-                    result.select_one('span.OrganicTextContentSpan') or
-                    result.select_one('div.TextContainer span') or
-                    result.select_one('div.organic__snippet') or
-                    result.select_one('div.organic__content')
-            )
-            if description_element:
-                data['description'] = description_element.get_text(strip=True)
-
-            # Phone
-            phone_full = result.select_one(PHONE_FULL_SELECTOR)
-            if phone_full and phone_full.get_text(strip=True):
-                data['phone'] = phone_full.get_text(strip=True)
-            else:
-                phone_element = result.select_one(PHONE_SPAN_SELECTOR)
-                if phone_element:
-                    text_inside = phone_element.get_text(strip=True)
-                    if text_inside and 'показ' not in text_inside.lower():
-                        data['phone'] = text_inside
-                    else:
-                        phone_json_str = phone_element.get("data-vnl") or phone_element.get("data-ibkqd")
-                        if phone_json_str:
-                            try:
-                                cleaned = phone_json_str.replace('&quot;', '"').replace('&amp;', '&')
-                                phone_json = json.loads(cleaned)
-                                if isinstance(phone_json, dict):
-                                    data['phone'] = phone_json.get('fullText')
-                            except Exception:
-                                pass
-
-            # Work time (полный текст блока)
-            meta_items = result.select('div.Meta-Item')
-            for mi in meta_items:
-                h3 = mi.select_one('h3.A11yHidden')
-                if h3 and 'время работы' in h3.get_text(strip=True).lower():
-                    data['work_time'] = mi.get_text(" ", strip=True)
-                    break
-
-            # Rating + reviews - ИСПРАВЛЕННАЯ ВЕРСИЯ
-            rating, reviews_count = extract_rating_and_reviews(result)
-            data['rating'] = rating
-            data['reviews_count'] = reviews_count
-
-            if data['title'] and data['url']:
-                page_data.append(data)
-
-            # Отладочный вывод для первых нескольких элементов
-            if page_number == 1 and idx <= 3:
-                print(
-                    f"[debug] Элемент #{idx}: title='{data['title'][:50] if data['title'] else None}...', rating='{data['rating']}', reviews='{data['reviews_count']}'")
-
-        except Exception as e:
-            print(f"[page {page_number}] Ошибка парсинга элемента #{idx}: {e}")
-            traceback.print_exc(file=sys.stdout)
-            continue
-    return page_data
-
-
-def find_next_button(page):
-    for sel in NEXT_BTN_SELECTORS:
-        try:
-            btn = page.query_selector(sel)
-            if btn:
-                return btn
-        except Exception:
-            continue
+            logging.error(f"Ошибка при запросе к {url} (попытка {attempt + 1}): {e}")
+        if attempt < MAX_RETRIES - 1:
+            await asyncio.sleep(RETRY_DELAY)
+    logging.error(f"Не удалось получить данные с {url} после {MAX_RETRIES} попыток.")
     return None
 
 
-def ask_yes_no(question: str) -> bool:
-    """Задает пользователю вопрос и возвращает True/False"""
+async def parse_sitemap_xml(session: ClientSession, url: str) -> list[str]:
+    logging.info(f"Загружаю sitemap: {url}")
+    text = await fetch_text(session, url)
+    if not text: return []
+    try:
+        root = ET.fromstring(text.encode('utf-8'))
+        locs = [el.text.strip() for el in root.findall(".//{http://www.sitemaps.org/schemas/sitemap/0.9}loc") if
+                el.text]
+        logging.info(f"Найдено {len(locs)} ссылок в sitemap: {url}")
+        return locs
+    except ET.ParseError:
+        logging.error(f"Ошибка парсинга XML в {url}.")
+        return []
+
+
+async def discover_city_rubrics_from_input(session: ClientSession, input_url: str) -> list[str]:
+    url = input_url.strip()
+    if url.endswith(".xml") and "/sitemap/" in url:
+        return await parse_sitemap_xml(session, url)
+    logging.warning(f"Неопознанный тип ссылки: {url}")
+    return []
+
+
+async def parse_company(session: ClientSession, company_url: str, city: str | None, rubric_url: str) -> dict | None:
+    html_text = await fetch_text(session, company_url)
+    if not html_text:
+        return None
+
+    try:
+        soup = BeautifulSoup(html_text, "lxml")
+        data = {
+            "city": city,
+            "rubric_url": rubric_url,
+            "url": company_url,
+            "name": None,
+            "address": None,
+            "phones": None,
+            "schedule": None,
+            "website": None,
+            "socials": None,
+            "email": None,
+            "categories": None
+        }
+
+        # Получаем название компании
+        h1 = soup.select_one("h1")
+        if h1:
+            data["name"] = h1.get_text(strip=True)
+        else:
+            data["name"] = "Название не найдено"
+
+        # Ищем контакты - используем более широкий поиск
+        contacts_panel = soup.select_one(".panel-body .item-text")
+        if not contacts_panel:
+            # Альтернативный поиск контактов
+            contacts_panel = soup.select_one(".item-text")
+            if not contacts_panel:
+                contacts_panel = soup.select_one(".panel-body")
+
+        # Собираем параграфы либо из панели контактов, либо из всего документа (fallback)
+        candidate_paragraphs = contacts_panel.find_all("p") if contacts_panel else soup.find_all("p")
+        if candidate_paragraphs:
+            for p_tag in candidate_paragraphs:
+                text = p_tag.get_text(" ", strip=True)
+                # Быстрый поиск по классам иконок без преобразования в HTML-строку
+                icon_span = p_tag.find("span", class_=True)
+                icon_classes = icon_span.get("class", []) if icon_span else []
+
+                matched = False
+                if "glyphicon-map-marker" in icon_classes:
+                    data["address"] = text; matched = True
+                elif "glyphicon-earphone" in icon_classes:
+                    data["phones"] = text; matched = True
+                elif "glyphicon-time" in icon_classes:
+                    data["schedule"] = text; matched = True
+                elif "glyphicon-share" in icon_classes:
+                    data["website"] = text; matched = True
+                elif "glyphicon-link" in icon_classes:
+                    links = [a.get("href") for a in p_tag.find_all("a", href=True)]
+                    data["socials"] = ", ".join(links) if links else text; matched = True
+                elif "glyphicon-envelope" in icon_classes:
+                    data["email"] = text; matched = True
+                elif "glyphicon-list" in icon_classes:
+                    cats = [a.get_text(strip=True) for a in p_tag.find_all("a")]
+                    data["categories"] = ", ".join(cats) if cats else text; matched = True
+
+                # Редкий случай: запасной путь через поиск по HTML (миграционная совместимость)
+                if not matched:
+                    p_html = str(p_tag)
+                    if "glyphicon-map-marker" in p_html:
+                        data["address"] = text
+                    elif "glyphicon-earphone" in p_html:
+                        data["phones"] = text
+                    elif "glyphicon-time" in p_html:
+                        data["schedule"] = text
+                    elif "glyphicon-share" in p_html:
+                        data["website"] = text
+                    elif "glyphicon-link" in p_html:
+                        links = [a.get("href") for a in p_tag.find_all("a", href=True)]
+                        data["socials"] = ", ".join(links) if links else text
+                    elif "glyphicon-envelope" in p_html:
+                        data["email"] = text
+                    elif "glyphicon-list" in p_html:
+                        cats = [a.get_text(strip=True) for a in p_tag.find_all("a")]
+                        data["categories"] = ", ".join(cats) if cats else text
+
+        logging.debug(
+            "    ↳ Собраны данные для компании: %s | Адрес: %s | Телефон: %s",
+            data['name'], bool(data['address']), bool(data['phones'])
+        )
+        return data
+    except Exception as e:
+        logging.error(f"Ошибка при парсинге карточки компании {company_url}: {e}")
+        return None
+
+
+async def parse_category(session: ClientSession, rubric_url: str, csv_writer, lock: asyncio.Lock):
+    rubric_url = ensure_trailing_slash(rubric_url)
+    city = extract_city_from_rubric(rubric_url)
+    rubric_name = rubric_url.rstrip('/').split('/')[-1]
+
+    logging.info(f"Начинаю обработку рубрики: {city}/{rubric_name}")
+    page = 1
+    total_companies_in_rubric = 0
+
     while True:
-        answer = input(f"{question} (y/n): ").lower().strip()
-        if answer in ['y', 'yes', 'да', 'д']:
-            return True
-        elif answer in ['n', 'no', 'нет', 'н']:
-            return False
-        else:
-            print("Пожалуйста, введите 'y' для да или 'n' для нет")
+        page_url = f"{rubric_url}page-{page}/" if page > 1 else rubric_url
+        html_text = await fetch_text(session, page_url)
+        if not html_text:
+            break
+
+        soup = BeautifulSoup(html_text, "lxml")
+        company_links = [a['href'] for a in soup.select(".panel.panel-info.object .panel-heading a[href]")]
+
+        if not company_links:
+            if page > 1:
+                logging.info(f"Достигнут конец рубрики {city}/{rubric_name} на странице {page}.")
+            break
+
+        # Собираем абсолютные ссылки и удаляем дубликаты, сохраняя порядок
+        seen_urls = set()
+        company_urls = []
+        for href in company_links:
+            abs_url = BASE + href if href.startswith('/') else href
+            if abs_url not in seen_urls:
+                seen_urls.add(abs_url)
+                company_urls.append(abs_url)
+        logging.info(
+            f"  Страница {page} [{city}/{rubric_name}]: найдено {len(company_urls)} компаний. Начинаю сбор данных...")
+
+        # Ограничиваем параллелизм для парсинга компаний
+        sem = asyncio.Semaphore(COMPANY_CONCURRENCY)
+
+        async def _parse_with_sem(url):
+            async with sem:
+                return await parse_company(session, url, city, rubric_url)
+
+        tasks = [_parse_with_sem(url) for url in company_urls]
+        results = await asyncio.gather(*tasks)
+        valid_results = [res for res in results if res]
+
+        if valid_results:
+            async with lock:
+                csv_writer.writerows(valid_results)
+            logging.info(
+                f"  Страница {page} [{city}/{rubric_name}]: СОХРАНЕНО {len(valid_results)}/{len(company_urls)} компаний в CSV.")
+            total_companies_in_rubric += len(valid_results)
+
+        # Небольшая пауза между страницами для снижения нагрузки, но быстрее, чем раньше
+        await asyncio.sleep(random.uniform(0.02, 0.05))
+        page += 1
+
+    logging.info(f"✅ Рубрика {city}/{rubric_name} завершена. Всего собрано: {total_companies_in_rubric} компаний.")
 
 
-def main():
-    pages_to_scrape = max(1, int(PAGES_TO_SCRAPE))
-    print(f"PAGES_TO_SCRAPE = {pages_to_scrape}")
-    all_scraped_data = []
-    parsed_date = datetime.now().strftime("%Y-%m-%d")
+async def main():
+    start_time = asyncio.get_event_loop().time()
+    logging.info("🚀 Запуск парсера BigSpr...")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, slow_mo=SLOW_MO_MS)
-        page = browser.new_page()
-        encoded_query = quote_plus(SEARCH_QUERY)
-        start_url = f"https://yandex.ru/search/?text={encoded_query}"
-        print(f"Открываю результаты поиска по запросу: '{SEARCH_QUERY}'")
-        page.goto(start_url)
-        time.sleep(PAUSE_AFTER_NAV_SEC)
-        banner_wait_for_user("Старт работы. Если есть капча — пройди её, дождись результатов.")
-        ensure_results_visible(page)
+    if not os.path.exists(INPUT_FILE):
+        logging.critical(f"❌ Файл не найден: {INPUT_FILE}")
+        return
 
-        for i in range(pages_to_scrape):
-            page_num = i + 1
-            print(f"\n--- Парсинг страницы {page_num} ---")
-            ensure_results_visible(page)
-            reveal_phones(page)
-            html_content = page.content()
-            page_data = parse_page(html_content, page_num, parsed_date)
-            print(f"[page {page_num}] Найдено {len(page_data)} результатов.")
+    with open(INPUT_FILE, "r", encoding="utf-8") as f:
+        input_lines = [line.strip() for line in f if line.strip()]
 
-            # Подсчет результатов с рейтингами
-            with_ratings = sum(1 for item in page_data if item['rating'])
-            print(f"[page {page_num}] Результатов с рейтингами: {with_ratings}")
+    connector = TCPConnector(
+        limit=HTTP_CONCURRENCY,
+        limit_per_host=HTTP_CONCURRENCY,
+        ttl_dns_cache=DNS_CACHE_TTL,
+        ssl=SSL_CONTEXT,
+        enable_cleanup_closed=True,
+    )
 
-            all_scraped_data.extend(page_data)
-            if AUTOSAVE_AFTER_EACH_PAGE:
-                df = pd.DataFrame(all_scraped_data)
-                df.to_csv(CSV_FILE_NAME, index=False, encoding='utf-8-sig')
+    # Инициализируем единые заголовки для всей сессии (случайный User-Agent один раз)
+    global BASE_HEADERS
+    BASE_HEADERS = get_random_headers()
 
-            if page_num < pages_to_scrape:
-                next_btn = find_next_button(page)
-                if next_btn:
-                    try:
-                        next_btn.scroll_into_view_if_needed()
-                    except Exception:
-                        pass
-                    try:
-                        next_btn.click(timeout=5000)
-                    except Exception:
-                        page.evaluate("(el) => el.click()", next_btn)
-                    page.wait_for_load_state('domcontentloaded')
-                    time.sleep(PAUSE_AFTER_NAV_SEC)
-                else:
-                    print("[nav] Кнопка следующей страницы не найдена. Останавливаюсь.")
-                    break
+    async with ClientSession(connector=connector, timeout=CLIENT_TIMEOUT, headers=BASE_HEADERS) as session:
+        logging.info("--- ЭТАП 1: Сбор URL рубрик из sitemap-ов ---")
+        discovery_tasks = [discover_city_rubrics_from_input(session, line) for line in input_lines]
+        results = await asyncio.gather(*discovery_tasks)
 
-        print("Закрываю браузер...")
-        browser.close()
+        # Дедупликация рубрик без сортировки (сохраняем порядок обнаружения)
+        rubric_urls = []
+        seen_rubrics = set()
+        for url_list in results:
+            for url in url_list:
+                if is_company_url(urlparse(url).path):
+                    continue
+                if url not in seen_rubrics:
+                    seen_rubrics.add(url)
+                    rubric_urls.append(url)
 
-    print("\nГотово. Сводим результаты...")
-    if all_scraped_data:
-        df = pd.DataFrame(all_scraped_data)
-        df.to_csv(CSV_FILE_NAME, index=False, encoding='utf-8-sig')
+        if not rubric_urls:
+            logging.critical("❌ Не найдено ни одной рубрики для парсинга.")
+            return
 
-        # Статистика по рейтингам
-        total_results = len(all_scraped_data)
-        with_ratings = len([item for item in all_scraped_data if item['rating']])
-        print(f"Данные сохранены в {CSV_FILE_NAME} (строк: {total_results})")
-        print(f"Результатов с рейтингами: {with_ratings} из {total_results}")
+        logging.info(f"✅ ИТОГ ЭТАПА 1: Найдено {len(rubric_urls)} уникальных рубрик для парсинга.")
 
-        # Спрашиваем про WHOIS проверку
-        print("\n" + "=" * 60)
-        print("ОСНОВНОЙ ПАРСИНГ ЗАВЕРШЕН")
-        print("=" * 60)
+        fieldnames = ["city", "rubric_url", "url", "name", "address", "phones", "schedule", "website", "socials",
+                      "email", "categories"]
+        csv_lock = asyncio.Lock()
 
-        if ask_yes_no("Хотите проверить домены через WHOIS.ru?"):
-            print("\n[WHOIS] Начинаю проверку доменов...")
-            enhanced_data = process_whois_for_domains(all_scraped_data)
+        logging.info(f"\n--- ЭТАП 2: Парсинг компаний из рубрик ---")
+        try:
+            # Увеличиваем буферизацию записи в файл для уменьшения нагрузки на диск
+            with open(OUTPUT_FILE, "w", newline="", encoding="utf-8", buffering=1024*1024) as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                logging.info(f"Создан CSV файл: {OUTPUT_FILE}")
 
-            # Сохраняем расширенные данные
-            df_enhanced = pd.DataFrame(enhanced_data)
-            df_enhanced.to_csv(CSV_WITH_WHOIS_NAME, index=False, encoding='utf-8-sig')
+                sem_category = asyncio.Semaphore(CATEGORY_CONCURRENCY)
+                progress_counter = 0
+                progress_lock = asyncio.Lock()
 
-            print(f"\n[WHOIS] Данные с WHOIS информацией сохранены в {CSV_WITH_WHOIS_NAME}")
+                async def run_category(rurl):
+                    nonlocal progress_counter
+                    async with sem_category:
+                        await parse_category(session, rurl, writer, csv_lock)
+                    async with progress_lock:
+                        progress_counter += 1
+                        progress = (progress_counter / len(rubric_urls)) * 100
+                        logging.info(
+                            f"📈 ПРОГРЕСС: {progress_counter}/{len(rubric_urls)} ({progress:.1f}%) | Время: {asyncio.get_event_loop().time() - start_time:.0f}с")
 
-            # Статистика по WHOIS
-            successful_whois = len(
-                [item for item in enhanced_data if item.get('whois_domain') and not item.get('whois_error')])
-            failed_whois = len([item for item in enhanced_data if
-                                item.get('whois_error') and item.get('whois_error') != 'No domain found'])
-            no_domain = len([item for item in enhanced_data if item.get('whois_error') == 'No domain found'])
+                await asyncio.gather(*[run_category(r) for r in rubric_urls])
+        except IOError as e:
+            logging.critical(f"Ошибка записи в файл {OUTPUT_FILE}: {e}")
 
-            print(f"[WHOIS] Успешно обработано доменов: {successful_whois}")
-            print(f"[WHOIS] Ошибок при обработке: {failed_whois}")
-            print(f"[WHOIS] Результатов без доменов: {no_domain}")
-        else:
-            print("[WHOIS] Проверка доменов пропущена.")
+    total_time = asyncio.get_event_loop().time() - start_time
+    try:
+        with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
+            total_companies = sum(1 for _ in f) - 1
+    except FileNotFoundError:
+        total_companies = 0
 
-    else:
-        print("Результатов нет — файл не создан.")
+    logging.info("\n" + "=" * 50 + "\n🎉 ПАРСИНГ ЗАВЕРШЕН!\n" + "=" * 50)
+    logging.info(f"📊 Обработано рубрик: {len(rubric_urls)}")
+    logging.info(f"🏢 Собрано компаний: {total_companies}")
+    logging.info(f"⏱️ Общее время: {total_time:.1f} секунд")
+    if total_time > 0:
+        logging.info(f"⚡ Средняя скорость: {total_companies / total_time:.1f} компаний/сек")
+    logging.info(f"💾 Результат сохранен в: {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
